@@ -7,6 +7,7 @@ using FEBio
 using FEBio.XML
 using Printf 
 using LeastSquaresOptim # Used for inverse FEA optimisation
+using GLM, DataFrames # For experimental data shifting
 
 GLMakie.closeall()
 
@@ -14,6 +15,39 @@ GLMakie.closeall()
 # Set FEBio exec path or name
 const FEBIO_EXEC = "febio4" # FEBio executable
 
+function export2csv(saveName, U, F)
+    results_IO = open(saveName, "w")        
+
+    # Create first heading line in CSV file 
+    firstLine = """Displacement, Force\n"""
+
+    # Write first line 
+    write(results_IO, firstLine)            
+
+    # Write force
+    for i in eachindex(U)
+        write(results_IO, @sprintf("%f", U[i]) * ", "
+                        * @sprintf("%f", F[i]) * "\n")
+    end
+    close(results_IO)
+end
+
+function R_squared(y, yf)
+    y_bar = mean(y)
+    SSres = sum((y.-yf).^2)
+    SStot = sum((y.-y_bar).^2)
+    Rsq = 1.0 - (SSres/SStot)
+    return Rsq
+end
+
+function lineFit(X, y)
+    data = DataFrame(X=X, y=y)
+    mdl = lm(@formula(y ~ X), data)
+    coefs = coef(mdl)
+    a = coefs[2] # Slope
+    b = coefs[1] # Intersept
+    return a, b
+end
 
 function fixteeth!(F, B; method=:add)
     if method == :add # Add interior teeth         
@@ -188,7 +222,12 @@ function import_csv(loadName)
                 D[s] = Vector{Float64}()
             end
         else
-            for i in eachindex(headingSet)
+            if i == 2
+                columnEnd = length(headingSet)
+            else
+                columnEnd = length(headingSet)-1
+            end
+            for i in 1:columnEnd
                 push!(D[headingSet[i]], parse(Float64, splitLine[i]))
             end
         end
@@ -197,31 +236,54 @@ function import_csv(loadName)
     return D
 end
 
-loadNameData = joinpath(febiojl_dir(), "assets", "data", "data_cylinder_compression_01.csv")
+material_selection = :DS10
+
+loadNamePath  = joinpath(dirname(@__DIR__), "assets")
+# loadNamePath = "/home/roland/Documents/Julia/Env_Silicone_gel_inverse_FEA/Silicone_gel_inverse_FEA/assets" #joinpath(febiojl_dir(), "assets", "data", "data_cylinder_compression_01.csv")
+
+if material_selection == :ECO10
+    loadNameData = joinpath(loadNamePath, "ECO10.csv")
+elseif material_selection == :ECO30
+    loadNameData = joinpath(loadNamePath, "ECO30.csv")
+elseif material_selection == :ECO50
+    loadNameData = joinpath(loadNamePath, "ECO50.csv")
+elseif material_selection == :DS10
+    loadNameData = joinpath(loadNamePath, "DS10.csv")
+end
 
 fit_data = import_csv(loadNameData)
 U_exp = fit_data["Displacement"]
 F_exp = fit_data["Force"]
 
+L0 = fit_data["L0"]
+
+## Shift graph so initial is at 0.0, 0.0 
+strainFit = 0.001
+b_fit = U_exp .<= (strainFit.*L0)
+a, b = lineFit(U_exp[b_fit], F_exp[b_fit])
+U_exp .-= -b/a
+pushfirst!(U_exp, 0.0)
+pushfirst!(F_exp, 0.0)
+
 ## Control parameters 
 
 # Loading 
-strainApplied = 0.35 # Equivalent linear strain
+# strainApplied = 0.30 # Equivalent linear strain
 
 # FEA control settings
-numTimeSteps = 15 # Number of time steps desired
+numTimeSteps = 20 # Number of time steps desired
 max_refs = 50 # Max reforms
 max_ups = 0 # Set to zero to use full-Newton iterations
-opt_iter = 10 # Optimum number of iterations
-max_retries = 5 # Maximum number of retires
+opt_iter = 8 # Optimum number of iterations
+max_retries = 15 # Maximum number of retries
 dtmin = (1.0/numTimeSteps)/100.0 # Minimum time step size
 dtmax = 1.0/numTimeSteps  # Maximum time step size
-symmetric_stiffness = 0 
+symmetric_stiffness = 1 
 min_residual = 1e-20
 
 # Geometry
 
-h = 45.0 # Sample height
+h = L0[1] - 2.0 # Sample height minus disc heights
 r = 25.0 # Sample radius 
 
 elementType = "hex20"# "tet10" # "tet4", "hex8", or "hex20"
@@ -262,7 +324,7 @@ if elementType == "hex8" || elementType == "hex20"
     pillowOutward = true
     nShrink = 2
     if pillowOutward==true && nShrink>0        
-        f_scale = (r - (nShrink*pointSpacing))/r
+        f_scale = (r - (nShrink*pointSpacing))/r #scale fator for shrinking
         V = [v*f_scale for v in V]
 
         F = element2faces(E)
@@ -366,12 +428,8 @@ if elementType == "hex8" || elementType == "hex20"
         V = smoothmesh_laplacian(F_uni,V,nMax,λ; constrained_points = constrained_points)
 
 
-        # constrained_points = elements2indices(Fb) #elements2indices(Fb[Cb.==3])        
-        # λ = 0.5
-        # Vs = smoothmesh_laplacian(F_uni,V,nMax,λ; constrained_points = constrained_points)
-        # V = [Point{3, Float64}(vs[1], vs[2], v[3]) for (vs, v) in zip(Vs, V)]
 
-        # # E, V = subhex(E,V,1)
+        # # E, V = subhex(E,V,1) #split 
 
         # # F = element2faces(E)
         # # indBoundaryFaces = boundaryfaceindices(F)
@@ -388,23 +446,6 @@ if elementType == "hex8" || elementType == "hex20"
         # #         Cb[i] = 3
         # #     end
         # # end
-
-        # # HC smoothing
-        # constrained_points = elements2indices(Fb)
-        # α = 0.1
-        # β = 0.5
-        # nMax = 50
-        # F_uni = gunique(F; sort_entries=true)
-        # # V = smoothmesh_hc(F_uni, V, nMax,α,β; constrained_points = constrained_points)
-
-        # constrained_points = elements2indices(Fb[Cb.==3])        
-        # λ = 0.5
-        # Vs = smoothmesh_laplacian(F_uni,V,nMax,λ; constrained_points = constrained_points)
-        # V = [Point{3, Float64}(vs[1], vs[2], v[3]) for (vs, v) in zip(Vs, V)]
-
-        # constrained_points = elements2indices(Fb)        
-        # λ = 0.5
-        # V = smoothmesh_laplacian(F_uni,V,nMax,λ; constrained_points = constrained_points)
 
     end
 
@@ -505,15 +546,19 @@ M = GeometryBasics.Mesh(Vbs,Fbs)
 fig = Figure(size=(1200, 800))
 
 ax1 = AxisGeom(fig[1, 1], title = "Boundary faces with boundary markers for the hexahedral mesh")
+hidedecorations!(ax1)
+hidespines!(ax1)
 # hp2 = meshplot!(ax1, Fbs, Vbs; strokewidth=3, color=Cbs_V, colormap=cmap)
 # hp3 = normalplot(ax1, Fbs, Vbs; type_flag=:face, color=:black,linewidth=3)
 
-hp2 = meshplot!(ax1, Fb, V; strokewidth=0.5, color=(:white, 0.5), transparency=true)
+hp2 = meshplot!(ax1, Fbs, Vbs; strokewidth=1, color=:white, stroke_depth_shift=-0.005f0)
 # hp2 = meshplot!(ax1, Fb, V; strokewidth=0.5, color=(:white, 0.5), transparency=true)
 # dirplot(ax1, Vb, Nb_V)
 
 ax2 = AxisGeom(fig[1, 2], title = "Cut view of hexahedral mesh")
-hp3 = meshplot!(ax2, Fbs, Vbs; strokewidth=1, color=:white)
+hp3 = meshplot!(ax2, Fbs, Vbs; strokewidth=1, color=:white, stroke_depth_shift=-0.005f0)
+hidedecorations!(ax2)
+hidespines!(ax2)
 
 VE  = simplexcenter(E,V)
 XE = [v[1] for v in VE]
@@ -525,8 +570,9 @@ numSlicerSteps = 3*ceil(Int,(xMax-xMin)/mean(edgelengths(F,V)))
 stepRange = range(xMin,xMax,numSlicerSteps)
 hSlider = Slider(fig[2, :], range = stepRange, startvalue = mean(stepRange), linewidth=30)
 
+
 on(hSlider.value) do x 
-    B = XE .<= x
+    B = XE .>= x
     indShow = findall(B)
     if isempty(indShow)
         hp3.visible=false        
@@ -541,10 +587,11 @@ end
 slidercontrol(hSlider,ax2)
 
 screen = display(GLMakie.Screen(), fig)
+save("hex_mesh.png", fig; px_per_unit = 8)
 
 
 # Defining displacement of the top surface in terms of x, y, and z components
-displacement_prescribed = -strainApplied*h
+displacement_prescribed = -maximum(U_exp) #-strainApplied*h
 
 ######
 # Define file names
@@ -561,11 +608,20 @@ filename_stress = "febioInputFile_01_STRESS.txt"
 filename_force = "febioInputFile_01_REACTION_FORCE.txt"
 
 global iterationCount = 1
+global Rsq = 0.0 
 
 function objective_FEA(x)
-    c1 = x[1]
-    m1 = x[2]
-    k = 1000 * c1
+    if materialOptimisationType == :Ogden
+        c1 = x[1]
+        m1 = x[2]
+        k = 1000 * c1
+    elseif materialOptimisationType == :NeoHookean
+        c1 = x[1]
+        m1 = 2.0
+        k = 1000 * c1
+    end
+
+   
     
     # function objectiveFunction_FEA(P, U_exp, F_exp)
 
@@ -641,8 +697,8 @@ function objective_FEA(x)
     material_node = aen(Material_node,"material"; id = "1", name="Material1", type="Ogden")
         aen(material_node, "c1",  c1)
         aen(material_node, "m1",  m1)
-        aen(material_node, "c2",  c1)
-        aen(material_node, "m2", -m1)
+        # aen(material_node, "c2",  c1)
+        # aen(material_node, "m2", -m1)
         aen(material_node, "k", k)
 
     # material_node = aen(Material_node,"material"; id = "1", name="Material1", type="Ogden unconstrained")
@@ -730,170 +786,256 @@ function objective_FEA(x)
 
     #######
     # Run FEBio
-    run_febio(filename_FEB,FEBIO_EXEC)
+    # try
+        run_febio(filename_FEB,FEBIO_EXEC)
+        
+        #######
+        # Import results
+        DD_disp = read_logfile(joinpath(saveDir,filename_disp))
+        DD_stress = read_logfile(joinpath(saveDir,filename_stress))
+        DD_force = read_logfile(joinpath(saveDir,filename_force))
+        numInc = length(DD_disp)
+        incRange = 0:1:numInc-1
 
-    #######
-    # Import results
-    DD_disp = read_logfile(joinpath(saveDir,filename_disp))
-    DD_stress = read_logfile(joinpath(saveDir,filename_stress))
-    DD_force = read_logfile(joinpath(saveDir,filename_force))
-    numInc = length(DD_disp)
-    incRange = 0:1:numInc-1
-
-    F = element2faces(E)
-    indBoundaryFaces = boundaryfaceindices(F)
-    Fb = F[indBoundaryFaces]
-    # Fbs, Vs = separate_vertices(Fb,V)
-    Sz = [d[1] for d in DD_stress[numInc-1].data] 
-    Sz_F = repeat(Sz,inner=6)
-    Sz_Fb = Sz_F[indBoundaryFaces]
-    Sz_V = simplex2vertexdata(Fb, Sz_Fb,V)
-
-    #######
-    # Visualization
-
-    # Create time varying vectors
-    global UT = fill(V,numInc) 
-    global VT = fill(V,numInc)
-    global SzT = fill(Sz_V,numInc)
-    global UT_mag = fill(zeros(length(V)),numInc)
-    global ut_mag_max = zeros(numInc)
-    global Sz_max = zeros(numInc)
-    global Sz_min = zeros(numInc)
-    global Fz_curve = zeros(numInc)
-    global Uz_curve = zeros(numInc)
-    time_curve = zeros(numInc)
-    @inbounds for i in 0:1:numInc-1    
-        UT[i+1] = [Point{3,Float64}(u) for u in DD_disp[i].data]
-        VT[i+1] += UT[i+1]
-        UT_mag[i+1] = norm.(UT[i+1])
-        ut_mag_max[i+1] = maximum(UT_mag[i+1]) 
-
-        Sz = [d[1] for d in DD_stress[i].data]
+        F = element2faces(E)
+        indBoundaryFaces = boundaryfaceindices(F)
+        Fb = F[indBoundaryFaces]
+        # Fbs, Vs = separate_vertices(Fb,V)
+        Sz = [d[1] for d in DD_stress[numInc-1].data] 
         Sz_F = repeat(Sz,inner=6)
         Sz_Fb = Sz_F[indBoundaryFaces]
-        Sz_V = simplex2vertexdata(Fb, Sz_Fb, V)
-        SzT[i+1] = Sz_V
-        Sz_min[i+1] = minimum(Sz)
-        Sz_max[i+1] = maximum(Sz)
-        Fz = [d[3] for d in DD_force[i].data]
-        Fz_curve[i+1] = -sum(Fz[indNodes_bcPrescribeList_z])
-        Uz_curve[i+1] = mean([u[3] for u in DD_disp[i].data])
-        time_curve[i+1] = DD_force[i].time
-    end
+        Sz_V = simplex2vertexdata(Fb, Sz_Fb,V)
 
-    min_p = minp([minp(V) for V in VT])
-    max_p = maxp([maxp(V) for V in VT])
+        #######
+        # Visualization
 
-    # Evaluate objective 
-    U_interp = range(0.0, Uz_curve[end], numTimeSteps) 
-    F_fea_interp = lerp(Uz_curve, Fz_curve, U_interp) 
-    F_exp_interp = lerp(U_exp,    F_exp,    U_interp) 
-    diff_exp = (F_fea_interp .- F_exp_interp) 
-    
-    V_plot_UF = Vector{Point{2,Float64}}(undef,length(Uz_curve))
-    for i in eachindex(Uz_curve)
-        V_plot_UF[i] = Point{2,Float64}(Uz_curve[i], Fz_curve[i])        
-    end
+        # Create time varying vectors
+        global UT = fill(V,numInc) 
+        global VT = fill(V,numInc)
+        global SzT = fill(Sz_V,numInc)
+        global UT_mag = fill(zeros(length(V)),numInc)
+        global ut_mag_max = zeros(numInc)
+        global Sz_max = zeros(numInc)
+        global Sz_min = zeros(numInc)
+        global Fz_curve = zeros(numInc)
+        global Uz_curve = zeros(numInc)
+        time_curve = zeros(numInc)
+        @inbounds for i in 0:1:numInc-1    
+            UT[i+1] = [Point{3,Float64}(u) for u in DD_disp[i].data]
+            VT[i+1] += UT[i+1]
+            UT_mag[i+1] = norm.(UT[i+1])
+            ut_mag_max[i+1] = maximum(UT_mag[i+1]) 
 
-    if iterationCount == 1
-        fig = Figure(size=(1200, 800))
-        global stepStart = incRange[end]
-        ax1 = AxisGeom(fig[1, 1], title = "Step: $stepStart", limits=(min_p[1], max_p[1], min_p[2], max_p[2], min_p[3], max_p[3]))
-        global hp1 = meshplot!(ax1, Fb, VT[end]; strokewidth=2, color=UT_mag[end], transparency=false, colormap = Reverse(:Spectral),colorrange=(0.0, maximum(ut_mag_max)))
-        Colorbar(fig[1, 2], hp1.plots[1], label = "Displacement magnitude [mm]") 
+            Sz = [d[1] for d in DD_stress[i].data]
+            Sz_F = repeat(Sz,inner=6)
+            Sz_Fb = Sz_F[indBoundaryFaces]
+            Sz_V = simplex2vertexdata(Fb, Sz_Fb, V)
+            SzT[i+1] = Sz_V
+            Sz_min[i+1] = minimum(Sz)
+            Sz_max[i+1] = maximum(Sz)
+            Fz = [d[3] for d in DD_force[i].data]
+            Fz_curve[i+1] = sum(Fz[indNodes_bcPrescribeList_z])
+            Uz_curve[i+1] = -mean([u[3] for u in DD_disp[i].data[indNodes_bcPrescribeList_z]])
+            time_curve[i+1] = DD_force[i].time
+        end
 
-        ax2 = AxisGeom(fig[1, 3], title = "Step: $stepStart", limits=(min_p[1], max_p[1], min_p[2], max_p[2], min_p[3], max_p[3]))
-        global hp2 = meshplot!(ax2, Fb, VT[end]; strokewidth=2, color=SzT[end], transparency=false, colormap = :viridis,colorrange=(minimum(Sz_min), maximum(Sz_max)))
-        Colorbar(fig[1, 4], hp2.plots[1], label = "σ [MPa]") 
+        min_p = minp([minp(V) for V in VT])
+        max_p = maxp([maxp(V) for V in VT])
 
-        ax3 = Axis(fig[1, 5], title = "Step: $stepStart", aspect = AxisAspect(1), xlabel="Displacement [mm]", ylabel="Force [N]")
-        hlp1 = lines!(ax3, U_exp, F_exp, color=:black, linewidth=5)
-        hlp2 = lines!(ax3, V_plot_UF, color=:red, linewidth=2)
-        Legend(fig[1, 6], [hlp1,hlp2],["Exp.", "FEA"])
+        # Evaluate objective 
+        U_interp = range(0.0, Uz_curve[end], numTimeSteps) 
+        F_fea_interp = lerp(Uz_curve, Fz_curve, U_interp) 
+        F_exp_interp = lerp(U_exp,    F_exp,    U_interp) 
+        diff_exp = (F_fea_interp .- F_exp_interp) 
+        global Rsq = R_squared(F_exp_interp, F_fea_interp)
+        println("R squared =  ",Rsq)
 
-        global hl = hlp2
+        
+        V_plot_UF = Vector{Point{2,Float64}}(undef,length(Uz_curve))
+        for i in eachindex(Uz_curve)
+            V_plot_UF[i] = Point{2,Float64}(Uz_curve[i], Fz_curve[i])        
+        end
 
-        hsp = scatter!(ax3, V_plot_UF[stepStart+1], markersize=15, color=:red)
-        println("Final force: ", V_plot_UF[end])
-        println("Number of elements: ",length(E))
+        if iterationCount == 1
+            fig = Figure(size=(1200, 800))
+            global stepStart = incRange[end]
+            ax1 = AxisGeom(fig[1, 1], title = "Step: $stepStart", limits=(min_p[1], max_p[1], min_p[2], max_p[2], min_p[3], max_p[3]))
+            global hp1 = meshplot!(ax1, Fb, VT[end]; strokewidth=2, color=UT_mag[end], transparency=false, colormap = Reverse(:Spectral),colorrange=(0.0, maximum(ut_mag_max)))
+            Colorbar(fig[1, 2], hp1.plots[1], label = "Displacement magnitude [mm]") 
+            hidedecorations!(ax1)
+            hidespines!(ax1)
 
-        global hs = hsp
+            ax2 = AxisGeom(fig[1, 3], title = "Step: $stepStart", limits=(min_p[1], max_p[1], min_p[2], max_p[2], min_p[3], max_p[3]))
+            global hp2 = meshplot!(ax2, Fb, VT[end]; strokewidth=2, color=SzT[end], transparency=false, colormap = :viridis,colorrange=(minimum(Sz_min), maximum(Sz_max)))
+            Colorbar(fig[1, 4], hp2.plots[1], label = "σ [MPa]") 
 
-        global hSlider = Slider(fig[2, :], range = incRange, startvalue = stepStart,linewidth=30)
-        on(hSlider.value) do stepIndex 
+            ax3 = Axis(fig[1, 5], title = "Step: $stepStart", aspect = AxisAspect(1), xlabel="Displacement [mm]", ylabel="Force [N]")
+            hlp1 = lines!(ax3, U_exp, F_exp, color=:black, linewidth=5)
+            hlp2 = lines!(ax3, V_plot_UF, color=:red, linewidth=2)
+            Legend(fig[1, 6], [hlp1,hlp2],["Exp.", "FEA"])
+
+            global hl = hlp2
+
+            hsp = scatter!(ax3, V_plot_UF[stepStart+1], markersize=15, color=:red)
+            println("Final force: ", V_plot_UF[end])
+            println("Number of elements: ",length(E))
+
+            global hs = hsp
+
+            global hSlider = Slider(fig[2, :], range = incRange, startvalue = stepStart,linewidth=30)
+            on(hSlider.value) do stepIndex 
+                hp1[1] = GeometryBasics.Mesh(VT[stepIndex+1],Fb)
+                hp1.color = UT_mag[stepIndex+1]
+
+                hp2[1] = GeometryBasics.Mesh(VT[stepIndex+1],Fb)
+                hp2.color = SzT[stepIndex+1]
+                    
+                hsp[1] = Point{2,Float64}(Uz_curve[stepIndex+1], Fz_curve[stepIndex+1])
+                ax1.title = "Step: $stepIndex"
+                ax2.title = "Step: $stepIndex"
+                ax3.title = "Step: $stepIndex"
+            end
+
+            slidercontrol(hSlider,ax1)
+
+            screen = display(GLMakie.Screen(), fig)
+            GLMakie.set_title!(screen, "FEBio example")
+        else
+            hSlider.range = incRange # Update to use the new range
+            stepIndex = incRange[end]  
+            hl[1] = V_plot_UF 
+            hs[1] = V_plot_UF[end]
+
             hp1[1] = GeometryBasics.Mesh(VT[stepIndex+1],Fb)
             hp1.color = UT_mag[stepIndex+1]
 
-            hp2[1] = GeometryBasics.Mesh(VT[stepIndex+1],Fb)
+            hp2[1] = GeometryBasics.Mesh(VT[stepIndex+1], Fb)
             hp2.color = SzT[stepIndex+1]
-                
-            hsp[1] = Point{2,Float64}(Uz_curve[stepIndex+1], Fz_curve[stepIndex+1])
-            ax1.title = "Step: $stepIndex"
-            ax2.title = "Step: $stepIndex"
-            ax3.title = "Step: $stepIndex"
         end
 
-        slidercontrol(hSlider,ax1)
+        if save_data == true
+            export2csv(saveName_fea, Uz_curve, Fz_curve)
+            export2csv(saveName_exp,    U_exp,    F_exp)
+        end
 
-        screen = display(GLMakie.Screen(), fig)
-        GLMakie.set_title!(screen, "FEBio example")
-    else
-        stepIndex = hSlider.value[]
-        hl[1] = V_plot_UF 
-        hs[1] = V_plot_UF[stepStart+1]
-
-        hp1[1] = GeometryBasics.Mesh(VT[stepIndex+1],Fb)
-        hp1.color = UT_mag[stepIndex+1]
-
-        hp2[1] = GeometryBasics.Mesh(VT[stepIndex+1], Fb)
-        hp2.color = SzT[stepIndex+1]
-    end
-
-    # saveName = joinpath(febiojl_dir(), "assets", "data", "data_cylinder_compression_01.csv")
-
-    # function export2csv(saveName, T, U, F)
-    #     results_IO = open(saveName, "w")        
-
-    #     # Create first heading line in CSV file 
-    #     firstLine = """Time, Displacement, Force\n"""
-        
-    #     # Write first line 
-    #     write(results_IO, firstLine)            
-                
-    #     # Write force
-    #     for i in eachindex(U)
-    #         write(results_IO, @sprintf("%f", T[i]) * ", " 
-    #                         * @sprintf("%f", U[i]) * ", "
-    #                         * @sprintf("%f", F[i]) * "\n")
-    #     end
-    #     close(results_IO)
+        # catch
+    #     return fill(NaN, numTimeSteps) # return NaNs if error occured
     # end
 
-    # export2csv(saveName, time_curve, Uz_curve, Fz_curve)
+    
+
 
     global iterationCount += 1
     return diff_exp
 end
-
-# True parameters 
-c1_true = 0.05*1.2
-m1_true = 2.0
-
-# Initial Ogden parameters 
-c1 = c1_true
-m1 = m1_true
-x0 = [c1, m1] # Initial guess
+##
 
 runMode = :testing  # :testing or  :optimisation 
+global materialOptimisationType = :Ogden #:NeoHookean #:Ogden
+
+if materialOptimisationType == :Ogden
+    c1_ini = 0.1829741220074908
+    m1_ini = 1.5598672279666972
+
+    # Initial Ogden parameters 
+    c1 = c1_ini
+    m1 = m1_ini
+    x0 = [c1, m1] # Initial guess
+   
+    # Best values
+
+    # ECO10
+    # c1 = 0.028138124434864447
+    # m1 = 1.9999532685014816
+    # Rsq = 0.9992369424797335
+
+    # EC030
+    # c1 = 0.04847352133320246
+    # m1 = 1.5326463713722551
+    # Rsq = 0.9996281023803054
+     
+    # EC050
+    # c1 = 0.07216149174989266
+    # m1 = 1.3121151444036485
+    # Rsq = 0.9998195315883609
+
+    # DS10
+    # c1 = 0.1829741220074908
+    # m1 = 1.5598672279666972
+    # Rsq = 0.9995346914075024
+
+elseif materialOptimisationType == :NeoHookean
+    c1_ini = 0.02808891403270298  
+    c1 = c1_ini
+    x0 = [c1 ] # Initial guess
+  
+    # Best values
+
+    # ECO10
+    # c1 = 0.02808891403270298
+    # Rsq = 0.9992564967164734
+
+    # ECO30
+    # c1 = 0.04896797373117905
+    # Rsq = 0.9994504401459033
+
+    # ECO50
+    # c1 = 0.0736743709886812
+    # Rsq = 0.9996368114219063
+
+    # DS10
+    # c1 = 0.1851271436833846
+    # Rsq = 0.9993408093031614
+end
+
+# Creating file names for saving optimisation results 
+if  materialOptimisationType == :NeoHookean
+    if material_selection == :ECO10
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_eco10_neo.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_eco10_exp.csv")
+    elseif material_selection == :ECO30
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_eco30_neo.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_eco30_exp.csv")
+    elseif material_selection == :ECO50
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_eco50_neo.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_eco50_exp.csv")
+    elseif material_selection == :DS10
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_DS10_neo.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_DS10_exp.csv")
+    end
+elseif materialOptimisationType == :Ogden
+    if material_selection == :ECO10
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_eco10_ogden.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_eco10_exp.csv")
+    elseif material_selection == :ECO30
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_eco30_ogden.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_eco30_exp.csv")
+    elseif material_selection == :ECO50
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_eco50_ogden.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_eco50_exp.csv")
+    elseif material_selection == :DS10
+        global saveName_fea = joinpath(loadNamePath, "results", "iFEA_DS10_ogden.csv")
+        global saveName_exp = joinpath(loadNamePath, "results", "iFEA_DS10_exp.csv")
+    end
+end
 
 if runMode == :optimisation 
     x_tol = 1e-3 # Parameter tolerance 
     f_tol = 1e-3 # Function tolerance
-    max_number_iterations = 3
-    W = optimize(objective_FEA, x0, LevenbergMarquardt(); x_tol=x_tol, f_tol=f_tol, iterations=max_number_iterations)
+    max_number_iterations = 100
+
+    global save_data = false 
+    W = optimize(objective_FEA, x0, LevenbergMarquardt(); x_tol=x_tol, f_tol=f_tol, iterations=max_number_iterations);
+    
+    global save_data = true
+    objective_FEA(W.minimizer);
+
     println("And the winner is....: ", W.minimizer)
-    println("True parameters: ", [c1_true, m1_true])
+    println("R_squared = ", Rsq)
+
 elseif runMode == :testing
-    objective_FEA(x0)
+    global save_data = true    
+    objective_FEA(x0);
 end
+
+##
